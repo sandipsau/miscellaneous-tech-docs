@@ -245,3 +245,69 @@ gold = spark.table("catalog.taxonomy.gold_current")
 - Tiny files? Run OPTIMIZE and review source emit size.
 - Duplicate rows? Verify dedupe keys and batch replay policy.
 - Mongo/Postgres write failures? Throttle batch size; verify indexes and locks.
+
+<br>
+
+# SCD strategy
+
+<div align="justify">
+SCD strategy stands for Slowly Changing Dimension strategy — it’s a data-warehousing technique for handling changes in master or reference data (like product taxonomy, customer, or hierarchy tables) over time without losing history.
+<div>
+
+## Here’s the breakdown:
+
+### 🧭 What a “Dimension” Is
+
+<div align="justify">
+A dimension table stores descriptive attributes about entities —
+e.g., product_id, category_name, parent_category, effective_date, etc.
+
+These attributes change slowly (not every transaction), so you must decide how to capture those changes when they occur.
+<div>
+
+### 🧩 Common SCD Strategies (Types)
+
+| **Type**   | **Description**                                            | **Effect**                                              | **Example Use Case**                        |
+| ---------- | ---------------------------------------------------------- | ------------------------------------------------------- | ------------------------------------------- |
+| **Type 0** | Keep original values; never update                         | Historical data never changes                           | Product launch name frozen forever          |
+| **Type 1** | Overwrite with latest value                                | No history maintained                                   | Fixing misspellings or typos                |
+| **Type 2** | Keep full history by versioning rows                       | Adds `valid_from`, `valid_to`, `is_current`             | Tracking price category or taxonomy changes |
+| **Type 3** | Store limited history (e.g., “previous value”) in same row | Keeps only one prior state                              | Useful for “before vs after” reports        |
+| **Type 4** | Maintain separate **history table**                        | Fact table joins only current, history stored elsewhere | High-volume dimensions                      |
+| **Type 6** | Hybrid (1 + 2 + 3)                                         | Combines overwrite & historical tracking                | Complex audit needs                         |
+
+### ⚙️ Example – SCD Type 2 (most common in Databricks)
+
+| product_id | category    | valid_from | valid_to   | is_current |
+| ---------- | ----------- | ---------- | ---------- | ---------- |
+| P100       | Tools       | 2023-01-01 | 2024-03-10 | false      |
+| P100       | Power Tools | 2024-03-11 | 9999-12-31 | true       |
+
+
+➡️ When category changes, the old record’s valid_to is set to yesterday,
+and a new version starts from the change date.
+
+### 💡 In Databricks / Delta Lake
+
+**Typically implement SCD 2 using MERGE**:
+
+```sql
+
+MERGE INTO product_taxonomy_history AS target
+USING staging_taxonomy AS source
+ON target.product_id = source.product_id AND target.is_current = true
+WHEN MATCHED AND target.category <> source.category THEN
+  UPDATE SET target.valid_to = current_date - 1, target.is_current = false
+WHEN NOT MATCHED THEN
+  INSERT (product_id, category, valid_from, valid_to, is_current)
+  VALUES (source.product_id, source.category, current_date, '9999-12-31', true);
+
+```
+
+### 🧠 Strategy Guidelines
+
+- Use Type 2 for entities whose history matters (taxonomy, hierarchy, pricing).
+- Use Type 1 for simple corrections or non-auditable attributes.
+- Partition your historical table by effective year/month for query performance.
+- Add a current-view table (filtered on is_current = true) for joins with fact data.
+- Track changes using hash columns (md5(concat_ws('|', ...))) to detect updates efficiently.
